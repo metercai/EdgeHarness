@@ -36,6 +36,7 @@ CONVERTIBLE_EXTENSIONS = {
 # Small files complete in < 1s synchronously; spawning a thread adds unnecessary
 # scheduling overhead for them.
 _ASYNC_THRESHOLD_BYTES = 1 * 1024 * 1024  # 1 MB
+_CONVERSION_TIMEOUT_SECONDS = 600
 
 # If pymupdf4llm produces fewer characters *per page* than this threshold,
 # the PDF is likely image-based or encrypted — fall back to MarkItDown.
@@ -44,6 +45,142 @@ _ASYNC_THRESHOLD_BYTES = 1 * 1024 * 1024  # 1 MB
 # Falls back to absolute 200-char check when page count is unavailable.
 _MIN_CHARS_PER_PAGE = 50
 
+# Default MinerU API endpoint (official)
+_MINERU_API_ENDPOINT = "https://mineru.net/api/v4" 
+# Default MinerU API timeout in seconds
+_MINERU_API_TIMEOUT = 120
+_MINERU_POLL_INTERVAL = 5         # polling interval
+
+async def _convert_pdf_with_mineru(file_path: Path) -> str | None:
+    """Attempt PDF conversion with MinerU API.
+
+    Args:
+        file_path: Path to the PDF file.
+
+    Returns:
+        The markdown text, or None if conversion fails.
+    """
+    import os
+    import io
+    import time
+    import httpx
+    import zipfile
+
+    endpoint = os.getenv("MINERU_API_ENDPOINT", _get_mineru_api())
+    api_key = os.getenv("MINERU_API_KEY", "")
+    api_timeout = int(os.getenv("MINERU_API_TIMEOUT", str(_MINERU_API_TIMEOUT)))
+    if not api_key:
+        logger.error("MINERU_API_KEY environment variable not set")
+        return None
+
+    try:
+        async with httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=httpx.Timeout(api_timeout)
+        ) as client:
+
+            # ========== Step 1: Obtain the upload pre signature link ==========
+            batch_url = f"{endpoint}/file-urls/batch"
+            payload = {
+                "files": [{"name": file_path.name, "data_id": file_path.stem}],
+                "model_version": "vlm",
+                # "enable_formula": True,
+                # "enable_table": True,
+                # "language": "ch",
+            }
+
+            resp = await client.post(batch_url, json=payload)
+            resp.raise_for_status()
+            result = resp.json()
+
+            if resp.status_code != 200 or result.get("code") != 0:
+                logger.error("MinerU get upload URL failed: %s", result.get("msg"))
+                return None
+
+            batch_id = result["data"]["batch_id"]
+            upload_urls = result["data"]["file_urls"]
+            if not upload_urls:
+                logger.error("MinerU returned empty upload URLs")
+                return None
+
+            # ========== Step 2: Upload file to pre signed URL ==========
+            file_content = await asyncio.to_thread(file_path.read_bytes)
+            upload_resp = await client.put(upload_urls[0], content=file_content, 
+                    headers={"Authorization": "", "Content-Type": ""})
+            upload_resp.raise_for_status()
+
+            logger.info("File %s uploaded, batch_id: %s", file_path.name, batch_id)
+
+            # ========== Step 3: Polling file parsing status ==========
+            results_url = f"{endpoint}/extract-results/batch/{batch_id}"
+            start_time = time.monotonic()
+
+            while True:
+                if time.monotonic() - start_time > _CONVERSION_TIMEOUT_SECONDS:
+                    logger.error("MinerU task %s timed out (%ds)", batch_id, _MINERU_MAX_WAIT_TIME)
+                    return None
+
+                poll_resp = await client.get(results_url)
+                poll_resp.raise_for_status()
+                poll_result = poll_resp.json()
+
+                if poll_result.get("code") != 0:
+                    logger.warning("MinerU poll error: %s, retrying...", poll_result.get("msg"))
+                    await asyncio.sleep(_MINERU_POLL_INTERVAL)
+                    continue
+
+                extract_data = poll_result.get("data", {})
+                
+                file_result = extract_data.get("extract_result")[0] or (
+                    extract_data.get("file_results", [{}])[0] if extract_data.get("file_results") else {}
+                )
+                status = file_result.get("state")
+                logger.info("MinerU task %s status: %s, waiting...", batch_id, status)
+
+                if status == "done":
+                    zip_url = file_result.get("full_zip_url") or extract_data.get("full_zip_url")
+                    if not zip_url:
+                        logger.error("Task done but missing full_zip_url")
+                        return None
+
+                    zip_resp = await client.get(zip_url)
+                    zip_resp.raise_for_status()
+
+                    def _extract_md(zip_bytes: bytes) -> str | None:
+                        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                            md_files = [n for n in zf.namelist() if n.endswith(".md")]
+                            md_files.sort(key=lambda x: 0 if x == "full.md" else 1)
+                            if not md_files:
+                                return None
+                            return zf.read(md_files[0]).decode("utf-8")
+
+                    markdown = await asyncio.to_thread(_extract_md, zip_resp.content)
+                    if markdown and markdown.strip():
+                        logger.info("MinerU conversion succeeded for %s", file_path.name)
+                        return markdown.strip()
+
+                    logger.warning("MinerU result contains empty markdown")
+                    return None
+
+                elif status in ("failed", "error"):
+                    err_msg = file_result.get("error_msg") or extract_data.get("error_msg", "unknown")
+                    logger.error("MinerU task %s failed: %s", batch_id, err_msg)
+                    return None
+
+                await asyncio.sleep(_MINERU_POLL_INTERVAL)
+
+    except httpx.TimeoutException:
+        logger.error("MinerU API request timed out for %s", file_path.name)
+        return None
+    except httpx.HTTPStatusError as e:
+        logger.error("MinerU HTTP %s error for %s: %s", e.response.status_code, file_path.name, e)
+        return None
+    except zipfile.BadZipFile:
+        logger.error("MinerU returned corrupted zip for %s", file_path.name)
+        return None
+    except Exception:
+        logger.exception("MinerU conversion failed for %s", file_path.name)
+        return None
 
 def _pymupdf_output_too_sparse(text: str, file_path: Path) -> bool:
     """Return True if pymupdf4llm output is suspiciously short (image-based PDF).
@@ -100,16 +237,16 @@ def _convert_with_markitdown(file_path: Path) -> str:
     return md.convert(str(file_path)).text_content
 
 
-def _do_convert(file_path: Path, pdf_converter: str) -> str:
+async def _do_convert(file_path: Path, pdf_converter: str) -> str:
     """Synchronous conversion — called directly or via asyncio.to_thread.
 
     Args:
         file_path: Path to the file.
-        pdf_converter: "auto" | "pymupdf4llm" | "markitdown"
+        pdf_converter: "auto" | "pymupdf4llm" | "mineru" | "markitdown"
     """
     is_pdf = file_path.suffix.lower() == ".pdf"
 
-    if is_pdf and pdf_converter != "markitdown":
+    if is_pdf and pdf_converter != "markitdown" and pdf_converter != "mineru":
         # Try pymupdf4llm first (auto or explicit)
         pymupdf_text = _convert_pdf_with_pymupdf4llm(file_path)
 
@@ -128,41 +265,64 @@ def _do_convert(file_path: Path, pdf_converter: str) -> str:
                 len(pymupdf_text.strip()),
                 file_path.name,
             )
-        # pymupdf4llm not installed or fallback triggered → use MarkItDown
+        # pymupdf4llm not installed or fallback triggered → use MinerU or MarkItDown
+    
+    if is_pdf and pdf_converter != "markitdown":
+        mineru_text = await _convert_pdf_with_mineru(file_path)
+
+        if mineru_text and mineru_text.strip():
+            return mineru_text
+
+        if pdf_converter == "mineru":
+            # Explicit — throw an exception
+            logger.erroring(f"MinerU failed for {file_path.name} (pdf_converter=mineru)")
+        else:
+            # auto mode：fall back if mineru failed
+            logger.warning("MinerU failed; falling back to markitdown")
 
     return _convert_with_markitdown(file_path)
 
 
-async def convert_file_to_markdown(file_path: Path) -> Path | None:
+async def convert_file_to_markdown(file_path: Path) -> Path:
     """Convert a supported document file to Markdown.
 
     PDF files are handled with a two-converter strategy (see module docstring).
     Large files (> 1 MB) are offloaded to a thread pool to avoid blocking the
-    event loop.
+    event loop. If conversion failed, error_text are write to md file.
 
     Args:
         file_path: Path to the file to convert.
 
     Returns:
-        Path to the generated .md file, or None if conversion failed.
+        Path to the generated .md file, if conversion failed.
     """
+    md_path = file_path.with_suffix(".md")
     try:
         pdf_converter = _get_pdf_converter()
         file_size = file_path.stat().st_size
 
         if file_size > _ASYNC_THRESHOLD_BYTES:
-            text = await asyncio.to_thread(_do_convert, file_path, pdf_converter)
+            text = await asyncio.wait_for(
+                    _do_convert(file_path, pdf_converter),
+                    timeout=_CONVERSION_TIMEOUT_SECONDS
+                    )
         else:
-            text = _do_convert(file_path, pdf_converter)
+            text = await _do_convert(file_path, pdf_converter)
 
-        md_path = file_path.with_suffix(".md")
         md_path.write_text(text, encoding="utf-8")
 
         logger.info("Converted %s to markdown: %s (%d chars)", file_path.name, md_path.name, len(text))
         return md_path
     except Exception as e:
         logger.error("Failed to convert %s to markdown: %s", file_path.name, e)
-        return None
+        error_text = {
+            "success": False,
+            "original_file": file_path.name,
+            "error": str(e),
+            "reason": "conversion_failed",
+        }
+        md_path.write_text(error_text, encoding="utf-8")
+        return md_path
 
 
 # Regex for bold-only lines that look like section headings.
@@ -199,7 +359,7 @@ _SPLIT_BOLD_HEADING_RE = re.compile(r"^\*\*[\dA-Z][\d\.]*\*\*\s+\*\*(?!\d[\d\s.,
 # Keeps prompt size bounded even for very long documents.
 MAX_OUTLINE_ENTRIES = 50
 
-_ALLOWED_PDF_CONVERTERS = {"auto", "pymupdf4llm", "markitdown"}
+_ALLOWED_PDF_CONVERTERS = {"auto", "pymupdf4llm", "mineru", "markitdown"}
 
 
 def _clean_bold_title(raw: str) -> str:
@@ -307,3 +467,28 @@ def _get_pdf_converter() -> str:
     except Exception:
         pass
     return "auto"
+
+def _get_mineru_api() -> str:
+    """Read mineru_api settings from app config.
+
+    Returns the custom endpoint string or default of MinerU
+    """
+    try:
+        from deerflow.config.app_config import get_app_config
+
+        cfg = get_app_config()
+        uploads_cfg = getattr(cfg, "uploads", None)
+
+        if uploads_cfg is not None:
+            # Get mineru_endpoint
+            mineru_endpoint = getattr(uploads_cfg, "mineru_api", None)
+            if mineru_endpoint:
+                mineru_endpoint = str(mineru_endpoint).strip()
+            else:
+                mineru_endpoint = _MINERU_API_ENDPOINT
+
+            return mineru_endpoint
+    except Exception:
+        pass
+        
+    return _MINERU_API_ENDPOINT

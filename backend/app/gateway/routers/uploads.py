@@ -3,7 +3,9 @@
 import logging
 import os
 import stat
+import asyncio
 
+from pathlib import Path
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
@@ -62,7 +64,12 @@ async def upload_files(
     thread_id: str,
     files: list[UploadFile] = File(...),
 ) -> UploadResponse:
-    """Upload multiple files to a thread's uploads directory."""
+    """Upload multiple files to a thread's uploads directory.
+    
+    Files are saved synchronously, but conversion to markdown is triggered
+    asynchronously in the background. The response is returned immediately
+    without waiting for conversion to complete.
+    """
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
 
@@ -113,18 +120,11 @@ async def upload_files(
 
             file_ext = file_path.suffix.lower()
             if file_ext in CONVERTIBLE_EXTENSIONS:
-                md_path = await convert_file_to_markdown(file_path)
-                if md_path:
-                    md_virtual_path = upload_virtual_path(md_path.name)
-
-                    if sync_to_sandbox and sandbox is not None:
-                        _make_file_sandbox_writable(md_path)
-                        sandbox.update_file(md_virtual_path, md_path.read_bytes())
-
-                    file_info["markdown_file"] = md_path.name
-                    file_info["markdown_path"] = str(sandbox_uploads / md_path.name)
-                    file_info["markdown_virtual_path"] = md_virtual_path
-                    file_info["markdown_artifact_url"] = upload_artifact_url(thread_id, md_path.name)
+                # Trigger async conversion in background - do not await
+                # This allows the upload endpoint to return immediately
+                asyncio.create_task(_convert_file_async(file_path, thread_id, sandbox_uploads, sandbox, sync_to_sandbox))
+                # file_info will be returned without markdown_file fields
+                # The frontend should poll /list endpoint to check conversion status
 
             uploaded_files.append(file_info)
 
@@ -135,8 +135,52 @@ async def upload_files(
     return UploadResponse(
         success=True,
         files=uploaded_files,
-        message=f"Successfully uploaded {len(uploaded_files)} file(s)",
+        message=f"Successfully uploaded {len(uploaded_files)} file(s). Conversion in progress.",
     )
+
+
+async def _convert_file_async(
+    file_path: Path,
+    thread_id: str,
+    sandbox_uploads: Path,
+    sandbox,
+    sync_to_sandbox: bool
+) -> None:
+    """Asynchronously convert a file to markdown in the background.
+    
+    Args:
+        file_path: Path to the original file
+        thread_id: Thread ID for artifact URL generation
+        sandbox_uploads: Sandbox uploads directory path
+        sandbox: Sandbox instance for updating files (if applicable)
+        sync_to_sandbox: Whether to sync files to sandbox
+    """
+    md_path = file_path.with_suffix(".md")
+    try:
+        MAX_CONVERTIBLE_SIZE = 50 * 1024 * 1024  # 50MB
+        if file_path.stat().st_size > MAX_CONVERTIBLE_SIZE:
+            raise ValueError(
+                f"File '{file_path.name}' size ({file_path.stat().st_size} bytes) "
+                f"exceeds maximum convertible size ({MAX_CONVERTIBLE_SIZE} bytes)"
+            )
+        md_path = await convert_file_to_markdown(file_path)
+    except Exception as e:
+        logger.error(f"Failed to convert {file_path.name} to markdown in background: {e}")
+        error_text = {
+            "success": False,
+            "original_file": file_path.name,
+            "error": str(e),
+            "reason": "conversion_failed",
+        }
+        md_path.write_text(error_text, encoding="utf-8")
+
+    md_virtual_path = upload_virtual_path(md_path.name)
+    if sync_to_sandbox and sandbox is not None:
+        _make_file_sandbox_writable(md_path)
+        sandbox.update_file(md_virtual_path, md_path.read_bytes())
+
+    #logger.info(f"Converted {file_path.name} to markdown: {md_path.name}")
+
 
 
 @router.get("/list", response_model=dict)

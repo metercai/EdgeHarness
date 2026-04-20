@@ -189,13 +189,34 @@ def upload_virtual_path(filename: str) -> str:
 
 
 def enrich_file_listing(result: dict, thread_id: str) -> dict:
-    """Add virtual paths, artifact URLs, and stringify sizes on a listing result.
+    """Add virtual paths, artifact URLs, stringify sizes, and link markdown files.
+
+    For each file, if a companion .md file exists (e.g., file.pdf.md for file.pdf),
+    adds markdown_file, markdown_path, markdown_virtual_path, and markdown_artifact_url
+    fields to the file entry.
 
     Mutates *result* in place and returns it for convenience.
     """
+    # Build a set of all filenames for quick lookup
+    all_filenames = {f["filename"] for f in result["files"]}
+    
     for f in result["files"]:
         filename = f["filename"]
         f["size"] = str(f["size"])
         f["virtual_path"] = upload_virtual_path(filename)
         f["artifact_url"] = upload_artifact_url(thread_id, filename)
+        
+        # Check for companion markdown file (filename.md)
+        md_filename = f"{filename}.md"
+        if md_filename in all_filenames:
+            md_file_info = next(
+                (file for file in result["files"] if file["filename"] == md_filename),
+                None
+            )
+            if md_file_info:
+                f["markdown_file"] = md_filename
+                f["markdown_path"] = md_file_info["path"]
+                f["markdown_virtual_path"] = upload_virtual_path(md_filename)
+                f["markdown_artifact_url"] = upload_artifact_url(thread_id, md_filename)
+    
     return result
