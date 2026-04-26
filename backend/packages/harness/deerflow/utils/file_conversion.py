@@ -19,6 +19,8 @@ import logging
 import re
 from pathlib import Path
 
+from deerflow.config.app_config import get_app_config
+
 logger = logging.getLogger(__name__)
 
 # File extensions that should be converted to markdown
@@ -234,7 +236,8 @@ def _convert_with_markitdown(file_path: Path) -> str:
     from markitdown import MarkItDown
 
     md = MarkItDown()
-    return md.convert(str(file_path)).text_content
+    md_text = md.convert(str(file_path)).text_content
+    return md_text
 
 
 async def _do_convert(file_path: Path, pdf_converter: str) -> str:
@@ -446,6 +449,15 @@ def extract_outline(md_path: Path) -> list[dict]:
     return outline
 
 
+def _get_uploads_config_value(key: str, default: object) -> object:
+    """Read a value from the uploads config, supporting dict and attribute access."""
+    cfg = get_app_config()
+    uploads_cfg = getattr(cfg, "uploads", None)
+    if isinstance(uploads_cfg, dict):
+        return uploads_cfg.get(key, default)
+    return getattr(uploads_cfg, key, default)
+
+
 def _get_pdf_converter() -> str:
     """Read pdf_converter setting from app config, defaulting to 'auto'.
 
@@ -454,16 +466,11 @@ def _get_pdf_converter() -> str:
     fall through to unexpected behaviour.
     """
     try:
-        from deerflow.config.app_config import get_app_config
-
-        cfg = get_app_config()
-        uploads_cfg = getattr(cfg, "uploads", None)
-        if uploads_cfg is not None:
-            raw = str(getattr(uploads_cfg, "pdf_converter", "auto")).strip().lower()
-            if raw not in _ALLOWED_PDF_CONVERTERS:
-                logger.warning("Invalid pdf_converter value %r; falling back to 'auto'", raw)
-                return "auto"
-            return raw
+        raw = str(_get_uploads_config_value("pdf_converter", "auto")).strip().lower()
+        if raw not in _ALLOWED_PDF_CONVERTERS:
+            logger.warning("Invalid pdf_converter value %r; falling back to 'auto'", raw)
+            return "auto"
+        return raw
     except Exception:
         pass
     return "auto"
