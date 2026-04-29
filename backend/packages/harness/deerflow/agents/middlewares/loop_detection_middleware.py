@@ -28,12 +28,12 @@ from langgraph.runtime import Runtime
 logger = logging.getLogger(__name__)
 
 # Defaults — can be overridden via constructor
-_DEFAULT_WARN_THRESHOLD = 3  # inject warning after 3 identical calls
-_DEFAULT_HARD_LIMIT = 5  # force-stop after 5 identical calls
+_DEFAULT_WARN_THRESHOLD = 10 #3  # inject warning after 3 identical calls
+_DEFAULT_HARD_LIMIT = 15 #5  # force-stop after 5 identical calls
 _DEFAULT_WINDOW_SIZE = 20  # track last N tool calls
 _DEFAULT_MAX_TRACKED_THREADS = 100  # LRU eviction limit
-_DEFAULT_TOOL_FREQ_WARN = 30  # warn after 30 calls to the same tool type
-_DEFAULT_TOOL_FREQ_HARD_LIMIT = 50  # force-stop after 50 calls to the same tool type
+_DEFAULT_TOOL_FREQ_WARN = 100 #30  # warn after 30 calls to the same tool type
+_DEFAULT_TOOL_FREQ_HARD_LIMIT = 200 #50  # force-stop after 50 calls to the same tool type
 
 
 def _normalize_tool_call_args(raw_args: object) -> tuple[dict, str | None]:
